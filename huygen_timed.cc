@@ -17,7 +17,7 @@ double get_local_time() {
     return ts.tv_sec + ts.tv_nsec * 1.0e-9;
 }
 
-void compute_drift(double *timestamps, double *received, int count, double *alpha, double *beta) {
+void compute_clocksync_regression(double *timestamps, double *received, int count, double *alpha, double *beta) {
     double sum_x = 0, sum_y = 0, sum_xx = 0, sum_xy = 0;
     for (int i = 0; i < count; i++) {
         sum_x += timestamps[i];
@@ -77,7 +77,7 @@ int main(int argc, char** argv) {
             MPI_Recv(&received_times[i], 1, MPI_DOUBLE, source, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
         }
         double alpha, beta;
-        compute_drift(timestamps, received_times, NUM_PROBES, &alpha, &beta);
+        compute_clocksync_regression(timestamps, received_times, NUM_PROBES, &alpha, &beta);
 
         double global_alphas[size];
         MPI_Gather(&alpha, 1, MPI_DOUBLE, global_alphas, 1, MPI_DOUBLE, MASTER, MPI_COMM_WORLD);
@@ -115,8 +115,11 @@ int main(int argc, char** argv) {
         }
 
         MPI_Barrier(MPI_COMM_WORLD);  
-	struct timespec req = { (int)DRIFT_INTERVAL, (DRIFT_INTERVAL - (int)DRIFT_INTERVAL) * 1e9 };
-        nanosleep(&req, NULL);     }
+	struct timespec req = { 
+		(int)DRIFT_INTERVAL,
+	       	(long)((DRIFT_INTERVAL - (int)DRIFT_INTERVAL) * 1e9) };
+       		 nanosleep(&req, NULL);    
+   	}
 
     /* ### Normal Allreduce Benchmark ****/
     double *local_array = (double *) malloc(array_size * sizeof(double));
