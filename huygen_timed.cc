@@ -82,13 +82,26 @@ int main(int argc, char** argv) {
         double global_alphas[size];
         MPI_Gather(&alpha, 1, MPI_DOUBLE, global_alphas, 1, MPI_DOUBLE, MASTER, MPI_COMM_WORLD);
 
-        double avg_alpha = 0.0;
-        if (rank == MASTER) {
-            for (int i = 0; i < size; i++) avg_alpha += global_alphas[i];
-            avg_alpha /= size;
-        }
-        MPI_Bcast(&avg_alpha, 1, MPI_DOUBLE, MASTER, MPI_COMM_WORLD);
-        local_clock -= avg_alpha;
+	double avg_alpha = 0.0;
+	double avg_beta = 0.0;
+
+	double global_betas[size];
+	MPI_Gather(&beta, 1, MPI_DOUBLE, global_betas, 1, MPI_DOUBLE, MASTER, MPI_COMM_WORLD);
+
+	if (rank == MASTER) {
+    		for (int i = 0; i < size; i++) {
+        		avg_alpha += global_alphas[i];
+        		avg_beta  += global_betas[i];
+    		}	
+    		avg_alpha /= size;
+    		avg_beta  /= size;
+	}
+
+	MPI_Bcast(&avg_alpha, 1, MPI_DOUBLE, MASTER, MPI_COMM_WORLD);
+	MPI_Bcast(&avg_beta, 1, MPI_DOUBLE, MASTER, MPI_COMM_WORLD);
+
+	// Apply both alpha and beta correction to local clock
+	local_clock = (local_clock * (1.0 - avg_alpha)) - avg_beta;
     } else {
         MPI_Barrier(MPI_COMM_WORLD);
     }
@@ -105,6 +118,7 @@ int main(int argc, char** argv) {
     for (int i = 0; i < DRIFT_MEASUREMENTS; i++) {
         double local_now = MPI_Wtime();
         double global_min, global_max;
+	double previous_drift = 0.0;
 
         MPI_Allreduce(&local_now, &global_min, 1, MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD);
         MPI_Allreduce(&local_now, &global_max, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
@@ -112,6 +126,11 @@ int main(int argc, char** argv) {
         if (rank == MASTER) {
             double drift = global_max - global_min;
             printf("Drift check %d: drift = %.9f seconds\n", i, drift);
+	    if (i > 0) {
+        	double drift_rate = (drift - previous_drift) / DRIFT_INTERVAL;
+        	printf("Estimated drift rate at check %d: %.9f seconds/second\n", i, drift_rate);
+    	     }
+    	   previous_drift = drift;
         }
 
         MPI_Barrier(MPI_COMM_WORLD);  
