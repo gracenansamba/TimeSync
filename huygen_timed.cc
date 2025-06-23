@@ -37,10 +37,46 @@ void compute_clocksync_regression(double *timestamps, double *received, int coun
     if (isnan(*beta)) *beta = 0.0;
 }
 
+
+void resync_clocks(double *local_clock, int rank, int size) {
+    double timestamps[NUM_PROBES], received_times[NUM_PROBES];
+    int target = (rank + 1) % size;
+    int source = (rank - 1 + size) % size;
+
+    for (int i = 0; i < NUM_PROBES; i++) {
+        timestamps[i] = get_local_time();
+        MPI_Send(&timestamps[i], 1, MPI_DOUBLE, target, 0, MPI_COMM_WORLD);
+        MPI_Recv(&received_times[i], 1, MPI_DOUBLE, source, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+    }
+
+    double alpha, beta;
+    compute_clocksync_regression(timestamps, received_times, NUM_PROBES, &alpha, &beta);
+
+    double global_alphas[size], global_betas[size];
+    MPI_Gather(&alpha, 1, MPI_DOUBLE, global_alphas, 1, MPI_DOUBLE, MASTER, MPI_COMM_WORLD);
+    MPI_Gather(&beta, 1, MPI_DOUBLE, global_betas, 1, MPI_DOUBLE, MASTER, MPI_COMM_WORLD);
+
+    double avg_alpha = 0.0, avg_beta = 0.0;
+    if (rank == MASTER) {
+        for (int i = 0; i < size; i++) {
+            avg_alpha += global_alphas[i];
+            avg_beta  += global_betas[i];
+        }
+        avg_alpha /= size;
+        avg_beta  /= size;
+    }
+
+    MPI_Bcast(&avg_alpha, 1, MPI_DOUBLE, MASTER, MPI_COMM_WORLD);
+    MPI_Bcast(&avg_beta, 1, MPI_DOUBLE, MASTER, MPI_COMM_WORLD);
+
+    *local_clock = (*local_clock * (1.0 - avg_alpha)) - avg_beta;
+}
+
 int main(int argc, char** argv) {
     MPI_Init(&argc, &argv);
 
     int rank, size;
+    int K=10;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
@@ -66,7 +102,7 @@ int main(int argc, char** argv) {
 
     /* ### Measure Synchronization Time ****/
     double sync_start = MPI_Wtime();
-
+/* 
     if (use_sync) {
         double timestamps[NUM_PROBES], received_times[NUM_PROBES];
         int target = (rank + 1) % size;
@@ -105,6 +141,15 @@ int main(int argc, char** argv) {
     } else {
         MPI_Barrier(MPI_COMM_WORLD);
     }
+*/
+
+
+    	if (use_sync) {
+    	resync_clocks(&local_clock, rank, size);
+	}
+	else {
+    	MPI_Barrier(MPI_COMM_WORLD);
+	}
 
     double sync_end = MPI_Wtime();
     double sync_duration = sync_end - sync_start;
@@ -149,11 +194,23 @@ int main(int argc, char** argv) {
     }
 
     double total_time = 0.0;
+    /*
     for (int i = 0; i < NUM_TRIALS; i++) {
         double start = MPI_Wtime();
         MPI_Allreduce(local_array, global_array, array_size, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
         double end = MPI_Wtime();
         total_time += (end - start);
+    }
+    */
+    for (int i = 0; i < NUM_TRIALS; i++) {
+    if (use_sync && i % K == 0 && i > 0) {
+        resync_clocks(&local_clock, rank, size);
+    }
+
+    double start = MPI_Wtime();
+    MPI_Allreduce(local_array, global_array, array_size, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    double end = MPI_Wtime();
+    total_time += (end - start);
     }
 
     free(local_array);
