@@ -1,3 +1,13 @@
+/*
+  
+One-time synchronization phase: processes exchange timestamps in a ring and use linear regression to estimate:
+Alpha(drift rate): how fast a process clock deviates
+Beta(offset): fixed time difference between clocks
+Clock correction: each process adjusts its time estimate to align with the system average.
+Drift tracking: regularly checks how desynchronized processes become over time.
+Periodic resynchronization after K iterations (like resetting clocks once they fall out of sync).
+
+*/
 #include <mpi.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -8,8 +18,8 @@
 #define NUM_PROBES 10
 #define NUM_TRIALS 100
 #define MASTER 0
-#define DRIFT_MEASUREMENTS 10  // how many times to check drift
-#define DRIFT_INTERVAL 0.1     // seconds between drift checks
+#define DRIFT_MEASUREMENTS 10  
+#define DRIFT_INTERVAL 0.1     
 
 double get_local_time() {
     struct timespec ts;
