@@ -14,8 +14,9 @@ Periodic resynchronization after K iterations (like resetting clocks once they f
 #include <time.h>
 #include <math.h>
 #include <string.h>
+#include <sys/stat.h>
 
-#define NUM_PROBES 10
+#define NUM_PROBES 20
 #define NUM_TRIALS 100
 #define MASTER 0
 #define DRIFT_MEASUREMENTS 10  
@@ -48,7 +49,7 @@ void compute_clocksync_regression(double *timestamps, double *received, int coun
 }
 
 
-void resync_clocks(double *local_clock, int rank, int size) {
+void resync_clocks(double *local_clock, int rank, int size, int resync_count) {
     double timestamps[NUM_PROBES], received_times[NUM_PROBES];
     int target = (rank + 1) % size;
     int source = (rank - 1 + size) % size;
@@ -59,6 +60,26 @@ void resync_clocks(double *local_clock, int rank, int size) {
         MPI_Recv(&received_times[i], 1, MPI_DOUBLE, source, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
     }
 
+    // save time probes for each rank 
+    //char filename[64];
+    char filename[128];
+    sprintf(filename, "logs/probes_p%d_rank%d.csv", size, rank);
+    FILE *fp = fopen(filename, "a");  // append mode (keeps multiple resyncs)
+
+    fseek(fp, 0, SEEK_END);
+	long fsize = ftell(fp);
+	if (fsize == 0) {
+    		fprintf(fp, "rank,resync_count,local_time,received_time\n");
+	}
+
+
+    for (int i = 0; i < NUM_PROBES; i++) {
+        fprintf(fp, "%d,%d,%.9f,%.9f\n",rank, resync_count, timestamps[i], received_times[i]);
+    }
+    fclose(fp);
+
+
+/* //remove my original regressoion 
     double alpha, beta;
     compute_clocksync_regression(timestamps, received_times, NUM_PROBES, &alpha, &beta);
 
@@ -80,13 +101,18 @@ void resync_clocks(double *local_clock, int rank, int size) {
     MPI_Bcast(&avg_beta, 1, MPI_DOUBLE, MASTER, MPI_COMM_WORLD);
 
     *local_clock = (*local_clock * (1.0 - avg_alpha)) - avg_beta;
+    */
 }
 
 int main(int argc, char** argv) {
     MPI_Init(&argc, &argv);
-
     int rank, size;
+
+    if (rank == 0) {
+        mkdir("logs", 0777);
+    }
     int K=10;
+    int resync_count = 0;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
@@ -155,7 +181,7 @@ int main(int argc, char** argv) {
 
 
     	if (use_sync) {
-    	resync_clocks(&local_clock, rank, size);
+    	resync_clocks(&local_clock, rank, size, resync_count);
 	}
 	else {
     	MPI_Barrier(MPI_COMM_WORLD);
@@ -214,7 +240,8 @@ int main(int argc, char** argv) {
     */
     for (int i = 0; i < NUM_TRIALS; i++) {
     if (use_sync && i % K == 0 && i > 0) {
-        resync_clocks(&local_clock, rank, size);
+	resync_count++;
+        resync_clocks(&local_clock, rank, size,resync_count);
     }
 
     double start = MPI_Wtime();
