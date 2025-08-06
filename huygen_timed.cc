@@ -22,6 +22,32 @@ Periodic resynchronization after K iterations (like resetting clocks once they f
 #define DRIFT_MEASUREMENTS 10  
 #define DRIFT_INTERVAL 0.1     
 
+#define MAX_RANKS 512
+#define MAX_RESYNC 20
+double skew_table[MAX_RANKS][MAX_RESYNC];  // Global lookup table
+
+void load_skew_table() {
+    FILE *fp = fopen("svr_skew_table.csv", "r");
+    if (!fp) {
+        fprintf(stderr, "Error: Could not open skew table.\n");
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+
+    char line[128];
+    fgets(line, sizeof(line), fp); // skip header
+
+    int r, c;
+    double skew;
+    while (fgets(line, sizeof(line), fp)) {
+        if (sscanf(line, "%d,%d,%lf", &r, &c, &skew) == 3) {
+            if (r < MAX_RANKS && c < MAX_RESYNC)
+                skew_table[r][c] = skew;
+        }
+    }
+    fclose(fp);
+}
+
+
 double get_local_time() {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -63,7 +89,7 @@ void resync_clocks(double *local_clock, int rank, int size, int resync_count) {
     // save time probes for each rank 
     //char filename[64];
     char filename[128];
-    sprintf(filename, "logs/probes_p%d_rank%d.csv", size, rank);
+    sprintf(filename, "logs_5/probes_p%d_rank%d.csv", size, rank);
     FILE *fp = fopen(filename, "a");  // append mode (keeps multiple resyncs)
 
     fseek(fp, 0, SEEK_END);
@@ -78,6 +104,11 @@ void resync_clocks(double *local_clock, int rank, int size, int resync_count) {
     }
     fclose(fp);
 
+    
+    if (resync_count < MAX_RESYNC && rank < MAX_RANKS) {
+    double predicted_skew = skew_table[rank][resync_count];
+    *local_clock -= predicted_skew;
+    }
 
 /* //remove my original regressoion 
     double alpha, beta;
@@ -109,7 +140,7 @@ int main(int argc, char** argv) {
     int rank, size;
 
     if (rank == 0) {
-        mkdir("logs", 0777);
+        mkdir("logs_5", 0777);
     }
     int K=10;
     int resync_count = 0;
@@ -181,6 +212,7 @@ int main(int argc, char** argv) {
 
 
     	if (use_sync) {
+        load_skew_table(); 
     	resync_clocks(&local_clock, rank, size, resync_count);
 	}
 	else {
@@ -221,7 +253,7 @@ int main(int argc, char** argv) {
        		 nanosleep(&req, NULL);    
    	}
 
-    /* ### Normal Allreduce Benchmark ****/
+    /* ### Allreduce Benchmark ****/
     double *local_array = (double *) malloc(array_size * sizeof(double));
     double *global_array = (double *) malloc(array_size * sizeof(double));
 
