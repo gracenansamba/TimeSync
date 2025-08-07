@@ -1,11 +1,15 @@
 /*
-  
+Part 1:
+
 One-time synchronization phase: processes exchange timestamps in a ring and use linear regression to estimate:
 Alpha(drift rate): how fast a process clock deviates
 Beta(offset): fixed time difference between clocks
 Clock correction: each process adjusts its time estimate to align with the system average.
 Drift tracking: regularly checks how desynchronized processes become over time.
 Periodic resynchronization after K iterations (like resetting clocks once they fall out of sync).
+
+Part 2 
+Added the SVR 
 
 */
 #include <mpi.h>
@@ -89,7 +93,7 @@ void resync_clocks(double *local_clock, int rank, int size, int resync_count) {
     // save time probes for each rank 
     //char filename[64];
     char filename[128];
-    sprintf(filename, "logs_5/probes_p%d_rank%d.csv", size, rank);
+    sprintf(filename, "logs_6/probes_p%d_rank%d.csv", size, rank);
     FILE *fp = fopen(filename, "a");  // append mode (keeps multiple resyncs)
 
     fseek(fp, 0, SEEK_END);
@@ -140,7 +144,7 @@ int main(int argc, char** argv) {
     int rank, size;
 
     if (rank == 0) {
-        mkdir("logs_5", 0777);
+        mkdir("logs_6", 0777);
     }
     int K=10;
     int resync_count = 0;
@@ -169,49 +173,8 @@ int main(int argc, char** argv) {
 
     /* ### Measure Synchronization Time ****/
     double sync_start = MPI_Wtime();
-/* 
+
     if (use_sync) {
-        double timestamps[NUM_PROBES], received_times[NUM_PROBES];
-        int target = (rank + 1) % size;
-        int source = (rank - 1 + size) % size;
-        for (int i = 0; i < NUM_PROBES; i++) {
-            timestamps[i] = get_local_time();
-            MPI_Send(&timestamps[i], 1, MPI_DOUBLE, target, 0, MPI_COMM_WORLD);
-            MPI_Recv(&received_times[i], 1, MPI_DOUBLE, source, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-        }
-        double alpha, beta;
-        compute_clocksync_regression(timestamps, received_times, NUM_PROBES, &alpha, &beta);
-
-        double global_alphas[size];
-        MPI_Gather(&alpha, 1, MPI_DOUBLE, global_alphas, 1, MPI_DOUBLE, MASTER, MPI_COMM_WORLD);
-
-	double avg_alpha = 0.0;
-	double avg_beta = 0.0;
-
-	double global_betas[size];
-	MPI_Gather(&beta, 1, MPI_DOUBLE, global_betas, 1, MPI_DOUBLE, MASTER, MPI_COMM_WORLD);
-
-	if (rank == MASTER) {
-    		for (int i = 0; i < size; i++) {
-        		avg_alpha += global_alphas[i];
-        		avg_beta  += global_betas[i];
-    		}	
-    		avg_alpha /= size;
-    		avg_beta  /= size;
-	}
-
-	MPI_Bcast(&avg_alpha, 1, MPI_DOUBLE, MASTER, MPI_COMM_WORLD);
-	MPI_Bcast(&avg_beta, 1, MPI_DOUBLE, MASTER, MPI_COMM_WORLD);
-
-	// Apply both alpha and beta correction to local clock
-	local_clock = (local_clock * (1.0 - avg_alpha)) - avg_beta;
-    } else {
-        MPI_Barrier(MPI_COMM_WORLD);
-    }
-*/
-
-
-    	if (use_sync) {
         load_skew_table(); 
     	resync_clocks(&local_clock, rank, size, resync_count);
 	}
@@ -231,7 +194,7 @@ int main(int argc, char** argv) {
     for (int i = 0; i < DRIFT_MEASUREMENTS; i++) {
         double local_now = MPI_Wtime();
         double global_min, global_max;
-	double previous_drift = 0.0;
+        double previous_drift = 0.0;
 
         MPI_Allreduce(&local_now, &global_min, 1, MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD);
         MPI_Allreduce(&local_now, &global_max, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
@@ -247,11 +210,11 @@ int main(int argc, char** argv) {
         }
 
         MPI_Barrier(MPI_COMM_WORLD);  
-	struct timespec req = { 
+        struct timespec req = { 
 		(int)DRIFT_INTERVAL,
 	       	(long)((DRIFT_INTERVAL - (int)DRIFT_INTERVAL) * 1e9) };
        		 nanosleep(&req, NULL);    
-   	}
+        }
 
     /* ### Allreduce Benchmark ****/
     double *local_array = (double *) malloc(array_size * sizeof(double));
@@ -262,14 +225,7 @@ int main(int argc, char** argv) {
     }
 
     double total_time = 0.0;
-    /*
-    for (int i = 0; i < NUM_TRIALS; i++) {
-        double start = MPI_Wtime();
-        MPI_Allreduce(local_array, global_array, array_size, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
-        double end = MPI_Wtime();
-        total_time += (end - start);
-    }
-    */
+  
     for (int i = 0; i < NUM_TRIALS; i++) {
     if (use_sync && i % K == 0 && i > 0) {
 	resync_count++;
