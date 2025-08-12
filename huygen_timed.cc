@@ -19,6 +19,8 @@ Added the SVR
 #include <math.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <unistd.h>
+
 
 #define NUM_PROBES 20
 #define NUM_TRIALS 100
@@ -84,12 +86,60 @@ void resync_clocks(double *local_clock, int rank, int size, int resync_count) {
     int target = (rank + 1) % size;
     int source = (rank - 1 + size) % size;
 
-    for (int i = 0; i < NUM_PROBES; i++) {
+   /* for (int i = 0; i < NUM_PROBES; i++) {
         timestamps[i] = get_local_time();
         MPI_Send(&timestamps[i], 1, MPI_DOUBLE, target, 0, MPI_COMM_WORLD);
         MPI_Recv(&received_times[i], 1, MPI_DOUBLE, source, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-    }
+    }*/
+    
+double epsilon = 1e-6; // You can experiment with this value
 
+    
+char filename[128];
+sprintf(filename, "logs_7/probes_p%d_rank%d.csv", size, rank);
+FILE *fp = fopen(filename, "a");
+
+fseek(fp, 0, SEEK_END);
+long fsize = ftell(fp);
+if (fsize == 0) {
+    fprintf(fp, "rank,resync_count,tx_a,rx_b,tx_b,rx_a\n");
+}
+    
+for (int i = 0; i < NUM_PROBES; i++) {
+    double tx_a = 0, rx_b = 0, tx_b = 0, rx_a = 0;
+
+    // Rank A (sender)
+    if (rank % 2 == 0) {
+        tx_a = get_local_time();
+        MPI_Send(&tx_a, 1, MPI_DOUBLE, target, 0, MPI_COMM_WORLD);
+        MPI_Recv(&rx_b, 1, MPI_DOUBLE, target, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        rx_a = get_local_time();
+
+        // You already sent tx_a and received rx_b
+        // But tx_b is known only to the receiver
+        // Option 1 (simple workaround): Receive tx_b as payload extension
+        MPI_Recv(&tx_b, 1, MPI_DOUBLE, target, 2, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+        // Apply the epsilon test
+        double discrepancy = fabs((rx_a - rx_b) - (tx_b - tx_a));
+        //if (discrepancy < epsilon) {
+            // Save only pure probes
+          fprintf(fp, "%d,%d,%.9f,%.9f,%.9f,%.9f\n", rank, resync_count, tx_a, rx_b, tx_b, rx_a);
+        //}
+
+    } else {  // Rank B (receiver)
+        MPI_Recv(&tx_a, 1, MPI_DOUBLE, source, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        rx_b = get_local_time();
+        tx_b = get_local_time();
+
+        MPI_Send(&rx_b, 1, MPI_DOUBLE, source, 1, MPI_COMM_WORLD);
+        MPI_Send(&tx_b, 1, MPI_DOUBLE, source, 2, MPI_COMM_WORLD);  // Send tx_b as extra packet
+    }
+}
+   
+    
+    
+/*
     // save time probes for each rank 
     //char filename[64];
     char filename[128];
@@ -108,12 +158,12 @@ void resync_clocks(double *local_clock, int rank, int size, int resync_count) {
     }
     fclose(fp);
 
-    
+ // SVR   
     if (resync_count < MAX_RESYNC && rank < MAX_RANKS) {
     double predicted_skew = skew_table[rank][resync_count];
     *local_clock -= predicted_skew;
     }
-
+*/
 /* //remove my original regressoion 
     double alpha, beta;
     compute_clocksync_regression(timestamps, received_times, NUM_PROBES, &alpha, &beta);
@@ -144,7 +194,7 @@ int main(int argc, char** argv) {
     int rank, size;
 
     if (rank == 0) {
-        mkdir("logs_6", 0777);
+        mkdir("logs_7", 0777);
     }
     int K=10;
     int resync_count = 0;
@@ -171,6 +221,11 @@ int main(int argc, char** argv) {
 
     double local_clock = get_local_time() + ((rank == 0) ? 0.05 : -0.05);
 
+    
+    char hostname[256];
+    gethostname(hostname, sizeof(hostname));
+    printf("Rank %d is running on node %s\n", rank, hostname);
+    
     /* ### Measure Synchronization Time ****/
     double sync_start = MPI_Wtime();
 
