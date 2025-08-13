@@ -101,7 +101,7 @@ FILE *fp = fopen(filename, "a");
 
 fseek(fp, 0, SEEK_END);
 long fsize = ftell(fp);
-if (fsize == 0) {
+if (resync_count == 0) {
     fprintf(fp, "rank,resync_count,tx_a,rx_b,tx_b,rx_a\n");
 }
     
@@ -109,31 +109,29 @@ for (int i = 0; i < NUM_PROBES; i++) {
     double tx_a = 0, rx_b = 0, tx_b = 0, rx_a = 0;
 
     // Rank A (sender)
+
     if (rank % 2 == 0) {
+        // Rank A (even)
         tx_a = get_local_time();
         MPI_Send(&tx_a, 1, MPI_DOUBLE, target, 0, MPI_COMM_WORLD);
         MPI_Recv(&rx_b, 1, MPI_DOUBLE, target, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
         rx_a = get_local_time();
-
-        // You already sent tx_a and received rx_b
-        // But tx_b is known only to the receiver
-        // Option 1 (simple workaround): Receive tx_b as payload extension
         MPI_Recv(&tx_b, 1, MPI_DOUBLE, target, 2, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
-        // Apply the epsilon test
-        double discrepancy = fabs((rx_a - rx_b) - (tx_b - tx_a));
-        //if (discrepancy < epsilon) {
-            // Save only pure probes
-          fprintf(fp, "%d,%d,%.9f,%.9f,%.9f,%.9f\n", rank, resync_count, tx_a, rx_b, tx_b, rx_a);
-        //}
+        fprintf(fp, "%d,%d,%.9f,%.9f,%.9f,%.9f\n",
+                rank, resync_count, tx_a, rx_b, tx_b, rx_a);
 
-    } else {  // Rank B (receiver)
+    } else {
+        // Rank B (odd)
         MPI_Recv(&tx_a, 1, MPI_DOUBLE, source, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
         rx_b = get_local_time();
         tx_b = get_local_time();
-
         MPI_Send(&rx_b, 1, MPI_DOUBLE, source, 1, MPI_COMM_WORLD);
-        MPI_Send(&tx_b, 1, MPI_DOUBLE, source, 2, MPI_COMM_WORLD);  // Send tx_b as extra packet
+        MPI_Send(&tx_b, 1, MPI_DOUBLE, source, 2, MPI_COMM_WORLD);
+
+        // Now odd ranks also log their view
+        fprintf(fp, "%d,%d,%.9f,%.9f,%.9f,%.9f\n",
+                rank, resync_count, tx_a, rx_b, tx_b, rx_a);
     }
 }
    
