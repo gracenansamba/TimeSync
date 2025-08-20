@@ -11,6 +11,9 @@ Periodic resynchronization after K iterations (like resetting clocks once they f
 Part 2 
 Added the SVR 
 
+Part 3
+Added the SVM model and used it to correct time 
+
 */
 #include <mpi.h>
 #include <stdio.h>
@@ -27,9 +30,25 @@ Added the SVR
 #define MASTER 0
 #define DRIFT_MEASUREMENTS 10  
 #define DRIFT_INTERVAL 0.1     
-
+#define TAG_TXA 0
+#define TAG_RXB 1
+#define TAG_TXB 2
+#define TAG_RXA 3
 #define MAX_RANKS 512
 #define MAX_RESYNC 20
+
+// #define MAX_RESYNC 256
+static double g_s[MAX_RESYNC], g_c[MAX_RESYNC];
+static unsigned char g_have[MAX_RESYNC];  // 1 if row present
+
+static inline double map_B_to_A(double tB, int k){
+    if (k < 0 || k >= MAX_RESYNC || !g_have[k]) return tB; // no-op if missing
+    return (tB - g_c[k]) / g_s[k];
+}
+
+static double g_epsilon = 5e-6;  // seconds (default 5 µs)
+
+/* this part is for the SVR formula but didnt yield speedup in the collective operation*/
 double skew_table[MAX_RANKS][MAX_RESYNC];  // Global lookup table
 
 void load_skew_table() {
@@ -38,10 +57,8 @@ void load_skew_table() {
         fprintf(stderr, "Error: Could not open skew table.\n");
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
-
     char line[128];
     fgets(line, sizeof(line), fp); // skip header
-
     int r, c;
     double skew;
     while (fgets(line, sizeof(line), fp)) {
@@ -53,12 +70,14 @@ void load_skew_table() {
     fclose(fp);
 }
 
-
 double get_local_time() {
     struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
+//    clock_gettime(CLOCK_MONOTONIC, &ts);
+    clock_gettime(CLOCK_REALTIME, &ts);
     return ts.tv_sec + ts.tv_nsec * 1.0e-9;
 }
+
+/* This is the Least square method*/
 
 void compute_clocksync_regression(double *timestamps, double *received, int count, double *alpha, double *beta) {
     double sum_x = 0, sum_y = 0, sum_xx = 0, sum_xy = 0;
@@ -85,57 +104,83 @@ void resync_clocks(double *local_clock, int rank, int size, int resync_count) {
     double timestamps[NUM_PROBES], received_times[NUM_PROBES];
     int target = (rank + 1) % size;
     int source = (rank - 1 + size) % size;
+    double epsilon = 1e-6; 
+    char filename[128];
+    sprintf(filename, "logs_3_real/probes_p%d_rank%d.csv", size, rank);
+    FILE *fp = fopen(filename, "a");
+    fseek(fp, 0, SEEK_END);
+    long fsize = ftell(fp);
 
-   /* for (int i = 0; i < NUM_PROBES; i++) {
-        timestamps[i] = get_local_time();
-        MPI_Send(&timestamps[i], 1, MPI_DOUBLE, target, 0, MPI_COMM_WORLD);
-        MPI_Recv(&received_times[i], 1, MPI_DOUBLE, source, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-    }*/
-    
-double epsilon = 1e-6; // You can experiment with this value
-
-    
-char filename[128];
-sprintf(filename, "logs_7/probes_p%d_rank%d.csv", size, rank);
-FILE *fp = fopen(filename, "a");
-
-fseek(fp, 0, SEEK_END);
-long fsize = ftell(fp);
-if (resync_count == 0) {
-    fprintf(fp, "rank,resync_count,tx_a,rx_b,tx_b,rx_a\n");
-}
-    
-for (int i = 0; i < NUM_PROBES; i++) {
-    double tx_a = 0, rx_b = 0, tx_b = 0, rx_a = 0;
-
-    // Rank A (sender)
-
-    if (rank % 2 == 0) {
-        // Rank A (even)
-        tx_a = get_local_time();
-        MPI_Send(&tx_a, 1, MPI_DOUBLE, target, 0, MPI_COMM_WORLD);
-        MPI_Recv(&rx_b, 1, MPI_DOUBLE, target, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-        rx_a = get_local_time();
-        MPI_Recv(&tx_b, 1, MPI_DOUBLE, target, 2, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-
-        fprintf(fp, "%d,%d,%.9f,%.9f,%.9f,%.9f\n",
-                rank, resync_count, tx_a, rx_b, tx_b, rx_a);
-
-    } else {
-        // Rank B (odd)
-        MPI_Recv(&tx_a, 1, MPI_DOUBLE, source, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-        rx_b = get_local_time();
-        tx_b = get_local_time();
-        MPI_Send(&rx_b, 1, MPI_DOUBLE, source, 1, MPI_COMM_WORLD);
-        MPI_Send(&tx_b, 1, MPI_DOUBLE, source, 2, MPI_COMM_WORLD);
-
-        // Now odd ranks also log their view
-        fprintf(fp, "%d,%d,%.9f,%.9f,%.9f,%.9f\n",
-                rank, resync_count, tx_a, rx_b, tx_b, rx_a);
+    if (ftell(fp) == 0) {
+        fprintf(fp, "rank,resync_count,tx_a,rx_b,tx_b,rx_a,keep_ab,keep_ba\n");
     }
-}
-   
-    
+
+    double prev_tx_a = 0.0, prev_rx_b = 0.0;  // A->B 
+    double prev_tx_b = 0.0, prev_rx_a = 0.0;  // B->A 
+
+    for (int i = 0; i < NUM_PROBES; i++) {
+        double tx_a = 0.0, rx_b = 0.0, tx_b = 0.0, rx_a = 0.0;
+        int keep_ab = 1, keep_ba = 1;  // first probe defaults to keep
+
+        if ((rank % 2) == 0) {
+            tx_a = get_local_time();
+            MPI_Send(&tx_a, 1, MPI_DOUBLE, target, TAG_TXA, MPI_COMM_WORLD);
+            MPI_Recv(&rx_b, 1, MPI_DOUBLE, target, TAG_RXB, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            rx_a = get_local_time();  // when A receives B's rx_b back
+
+            MPI_Recv(&tx_b, 1, MPI_DOUBLE, target, TAG_TXB, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            MPI_Send(&rx_a, 1, MPI_DOUBLE, target, TAG_RXA, MPI_COMM_WORLD);
+	
+	    if (g_have[resync_count]) {
+           	 rx_b = map_B_to_A(rx_b, resync_count);
+            	tx_b = map_B_to_A(tx_b, resync_count);
+            }
+
+            if (i > 0) {
+                double d_txAB = tx_a - prev_tx_a;
+                double d_rxAB = rx_b - prev_rx_b;
+                keep_ab = (fabs(d_rxAB - d_txAB) <= g_epsilon);
+
+                double d_txBA = tx_b - prev_tx_b;
+                double d_rxBA = rx_a - prev_rx_a;
+                keep_ba = (fabs(d_rxBA - d_txBA) <= g_epsilon);
+            }
+
+            prev_tx_a = tx_a;
+            prev_rx_b = rx_b;
+            prev_tx_b = tx_b;
+            prev_rx_a = rx_a;
+
+        } else {
+            MPI_Recv(&tx_a, 1, MPI_DOUBLE, source, TAG_TXA, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            rx_b = get_local_time();
+
+            tx_b = get_local_time();
+            MPI_Send(&rx_b, 1, MPI_DOUBLE, source, TAG_RXB, MPI_COMM_WORLD);
+            MPI_Send(&tx_b, 1, MPI_DOUBLE, source, TAG_TXB, MPI_COMM_WORLD);
+
+            MPI_Recv(&rx_a, 1, MPI_DOUBLE, source, TAG_RXA, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+            if (i > 0) {
+                double d_txAB = tx_a - prev_tx_a;
+                double d_rxAB = rx_b - prev_rx_b;
+                keep_ab = (fabs(d_rxAB - d_txAB) <= g_epsilon);
+
+                double d_txBA = tx_b - prev_tx_b;
+                double d_rxBA = rx_a - prev_rx_a;
+                keep_ba = (fabs(d_rxBA - d_txBA) <= g_epsilon);
+            }
+
+            prev_tx_a = tx_a; prev_rx_b = rx_b;
+            prev_tx_b = tx_b; prev_rx_a = rx_a;
+        }
+
+        fprintf(fp, "%d,%d,%.9f,%.9f,%.9f,%.9f,%d,%d\n",
+                rank, resync_count, tx_a, rx_b, tx_b, rx_a, keep_ab, keep_ba);
+    }
+
+fflush(fp);
+fclose(fp);    
     
 /*
     // save time probes for each rank 
@@ -187,18 +232,50 @@ for (int i = 0; i < NUM_PROBES; i++) {
     */
 }
 
+
+static int load_sc_csv(const char *path){
+    for (int i=0;i<MAX_RESYNC;i++) 
+        g_have[i]=0;
+    FILE *fp = fopen(path, "r");
+    if (!fp) return 0;
+    int rows=0, r; double s, c;
+    while (fscanf(fp, "%d,%lf,%lf", &r, &s, &c) == 3){
+        if (0 <= r && r < MAX_RESYNC){
+            g_s[r] = s; g_c[r] = c; g_have[r] = 1; rows++;
+        }
+    }
+    fclose(fp);
+    return rows;
+}
+
 int main(int argc, char** argv) {
     MPI_Init(&argc, &argv);
     int rank, size;
 
-    if (rank == 0) {
-        mkdir("logs_7", 0777);
-    }
     int K=10;
     int resync_count = 0;
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
+    // argv[3] can specify the path; defaults to "svm_sc.csv" in CWD
+
+    const char *sc_path = (argc > 3) ? argv[3] : "svm_sc.csv";
+    int sc_rows = 0;
+    if (rank == 0) {
+        sc_rows = load_sc_csv(sc_path);  // fills g_s[], g_c[], g_have[]
+        printf("Loaded %d rows from %s\n", sc_rows, sc_path);
+    }
+    // share to everyone so all ranks can map B->A the same way
+
+    MPI_Bcast(g_s,    MAX_RESYNC, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    MPI_Bcast(g_c,    MAX_RESYNC, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+    MPI_Bcast(g_have, MAX_RESYNC, MPI_UNSIGNED_CHAR, 0, MPI_COMM_WORLD);
+
+    if (rank == 0) {
+        mkdir("logs_3_real", 0777);
+    }
+
+    MPI_Barrier(MPI_COMM_WORLD);
     int use_sync = 1;
     if (argc > 1 && atoi(argv[1]) == 1) {
         use_sync = 0;
@@ -210,7 +287,6 @@ int main(int argc, char** argv) {
     }
 
     int array_size = base_array_size * size;
-
     if (rank == MASTER) {
         printf("Running with %d processes\n", size);
         printf("Each process reducing %d doubles (%.2f MB)\n",
@@ -219,16 +295,14 @@ int main(int argc, char** argv) {
 
     double local_clock = get_local_time() + ((rank == 0) ? 0.05 : -0.05);
 
-    
     char hostname[256];
     gethostname(hostname, sizeof(hostname));
     printf("Rank %d is running on node %s\n", rank, hostname);
     
     /* ### Measure Synchronization Time ****/
     double sync_start = MPI_Wtime();
-
     if (use_sync) {
-        load_skew_table(); 
+     //   load_skew_table(); 
     	resync_clocks(&local_clock, rank, size, resync_count);
 	}
 	else {
