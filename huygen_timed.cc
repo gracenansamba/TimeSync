@@ -24,7 +24,6 @@ Added the SVM model and used it to correct time
 #include <sys/stat.h>
 #include <unistd.h>
 
-
 #define NUM_PROBES 20
 #define NUM_TRIALS 100
 #define MASTER 0
@@ -46,7 +45,24 @@ static inline double map_B_to_A(double tB, int k){
     return (tB - g_c[k]) / g_s[k];
 }
 
+double get_local_time() {
+    struct timespec ts;
+//    clock_gettime(CLOCK_MONOTONIC, &ts);
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return ts.tv_sec + ts.tv_nsec * 1.0e-9;
+}
+
+static inline double aligned_now(int k) {
+    double t_local = get_local_time();              // SAME base as your probes
+    if (k >= 0 && k < MAX_RESYNC && g_have[k]) {
+        return (t_local - g_c[k]) / g_s[k];         // t_aligned = (t - c)/s
+    }
+    return t_local;                                  // fallback if model missing
+}
+
 static double g_epsilon = 5e-6;  // seconds (default 5 µs)
+
+
 
 /* this part is for the SVR formula but didnt yield speedup in the collective operation*/
 double skew_table[MAX_RANKS][MAX_RESYNC];  // Global lookup table
@@ -70,12 +86,6 @@ void load_skew_table() {
     fclose(fp);
 }
 
-double get_local_time() {
-    struct timespec ts;
-//    clock_gettime(CLOCK_MONOTONIC, &ts);
-    clock_gettime(CLOCK_REALTIME, &ts);
-    return ts.tv_sec + ts.tv_nsec * 1.0e-9;
-}
 
 /* This is the Least square method*/
 
@@ -106,7 +116,7 @@ void resync_clocks(double *local_clock, int rank, int size, int resync_count) {
     int source = (rank - 1 + size) % size;
     double epsilon = 1e-6; 
     char filename[128];
-    sprintf(filename, "logs_3_real/probes_p%d_rank%d.csv", size, rank);
+    sprintf(filename, "logs-9-9-r8/probes_p%d_rank%d.csv", size, rank);
     FILE *fp = fopen(filename, "a");
     fseek(fp, 0, SEEK_END);
     long fsize = ftell(fp);
@@ -257,7 +267,6 @@ int main(int argc, char** argv) {
     MPI_Comm_rank(MPI_COMM_WORLD, &rank);
     MPI_Comm_size(MPI_COMM_WORLD, &size);
 
-    // argv[3] can specify the path; defaults to "svm_sc.csv" in CWD
 
     const char *sc_path = (argc > 3) ? argv[3] : "svm_sc.csv";
     int sc_rows = 0;
@@ -270,9 +279,9 @@ int main(int argc, char** argv) {
     MPI_Bcast(g_s,    MAX_RESYNC, MPI_DOUBLE, 0, MPI_COMM_WORLD);
     MPI_Bcast(g_c,    MAX_RESYNC, MPI_DOUBLE, 0, MPI_COMM_WORLD);
     MPI_Bcast(g_have, MAX_RESYNC, MPI_UNSIGNED_CHAR, 0, MPI_COMM_WORLD);
-
+    
     if (rank == 0) {
-        mkdir("logs_3_real", 0777);
+        mkdir("logs-9-9-r8", 0777);
     }
 
     MPI_Barrier(MPI_COMM_WORLD);
@@ -286,7 +295,8 @@ int main(int argc, char** argv) {
         base_array_size = atoi(argv[2]);
     }
 
-    int array_size = base_array_size * size;
+    //int array_size = base_array_size * size;
+    int array_size = base_array_size;
     if (rank == MASTER) {
         printf("Running with %d processes\n", size);
         printf("Each process reducing %d doubles (%.2f MB)\n",
@@ -319,7 +329,9 @@ int main(int argc, char** argv) {
 
     /* ### Start Drift Trackin ****/
     for (int i = 0; i < DRIFT_MEASUREMENTS; i++) {
-        double local_now = MPI_Wtime();
+        //double local_now = MPI_Wtime();
+        double local_now = use_sync ? aligned_now(resync_count) : MPI_Wtime(); // when use_sync is on, the min/max drift you print is measured on the aligned clock
+
         double global_min, global_max;
         double previous_drift = 0.0;
 
@@ -359,6 +371,36 @@ int main(int argc, char** argv) {
         resync_clocks(&local_clock, rank, size,resync_count);
     }
 
+        
+        if (use_sync) {
+        // 1) each rank’s current time on the shared timeline
+        double me_align = aligned_now(resync_count);
+
+        // 2) agree on a common future start time (avoid jitter)
+        double t_max;
+        MPI_Allreduce(&me_align, &t_max, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+        double t_start = t_max + 2e-4;  // 200 µs headroom; tune 1e-4..5e-4 if needed
+
+        // 3) wait until our aligned time reaches that instant
+        struct timespec nap = {0, 20000}; // 20 µs naps to avoid busy-spin
+        while (aligned_now(resync_count) < t_start) {
+            nanosleep(&nap, NULL);
+        }
+    }
+    /*
+       if (use_sync) {
+        // “grid” pacing: align to the next small boundary on the shared clock
+        const double slot_len = 200e-6;               // 200 µs; tune 100–500 µs
+        double t = aligned_now(resync_count);         // corrected time = (t_local - c)/s
+        double t_start = ceil(t / slot_len) * slot_len;
+
+        struct timespec nap = {0, 20000};            // 20 µs naps (avoid busy spin)
+        while (aligned_now(resync_count) < t_start) {
+            nanosleep(&nap, NULL);
+        }
+    }
+    */
+        
     double start = MPI_Wtime();
     MPI_Allreduce(local_array, global_array, array_size, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
     double end = MPI_Wtime();
