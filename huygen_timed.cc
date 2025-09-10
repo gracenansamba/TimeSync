@@ -47,11 +47,11 @@ static inline double map_B_to_A(double tB, int k){
 
 double get_local_time() {
     struct timespec ts;
-//    clock_gettime(CLOCK_MONOTONIC, &ts);
-    clock_gettime(CLOCK_REALTIME, &ts);
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    //clock_gettime(CLOCK_REALTIME, &ts);
     return ts.tv_sec + ts.tv_nsec * 1.0e-9;
 }
-
+/*
 static inline double aligned_now(int k) {
     double t_local = get_local_time();              // SAME base as your probes
     if (k >= 0 && k < MAX_RESYNC && g_have[k]) {
@@ -59,6 +59,22 @@ static inline double aligned_now(int k) {
     }
     return t_local;                                  // fallback if model missing
 }
+*/
+static inline double aligned_now(int k) {
+    double t = get_local_time();
+    if (k >= 0 && k < MAX_RESYNC && g_have[k]) {
+        double s = g_s[k], c = g_c[k];
+        // Reject bogus/unstable models
+        if (!isfinite(s) || !isfinite(c) || s <= 0.5 || s >= 1.5) {
+            return t; // fallback to raw time
+        }
+        return (t - c) / s;
+    }
+    return t;
+}
+
+
+
 
 static double g_epsilon = 5e-6;  // seconds (default 5 µs)
 
@@ -116,7 +132,7 @@ void resync_clocks(double *local_clock, int rank, int size, int resync_count) {
     int source = (rank - 1 + size) % size;
     double epsilon = 1e-6; 
     char filename[128];
-    sprintf(filename, "logs-9-9-r8/probes_p%d_rank%d.csv", size, rank);
+    sprintf(filename, "logs-9-9-rwork/probes_p%d_rank%d.csv", size, rank);
     FILE *fp = fopen(filename, "a");
     fseek(fp, 0, SEEK_END);
     long fsize = ftell(fp);
@@ -280,8 +296,30 @@ int main(int argc, char** argv) {
     MPI_Bcast(g_c,    MAX_RESYNC, MPI_DOUBLE, 0, MPI_COMM_WORLD);
     MPI_Bcast(g_have, MAX_RESYNC, MPI_UNSIGNED_CHAR, 0, MPI_COMM_WORLD);
     
+    
+    if (rank == 0) { mkdir("logs_align", 0777); }
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    static FILE *align_fp = NULL;
+    {
+        char fn[128];
+        snprintf(fn, sizeof(fn), "logs_align/align_rank%d.csv", rank);
+        align_fp = fopen(fn, "a");
+        if (align_fp) {
+        // Add header only if empty file
+            fseek(align_fp, 0, SEEK_END);
+            if (ftell(align_fp) == 0) {
+                fprintf(align_fp, "resync,trial,lag_pre,waited,lag_post,timed_out\n");
+                fflush(align_fp);
+            }
+        }
+    }
+
+    
+    
+    
     if (rank == 0) {
-        mkdir("logs-9-9-r8", 0777);
+        mkdir("logs-9-9-rwork", 0777);
     }
 
     MPI_Barrier(MPI_COMM_WORLD);
@@ -372,34 +410,57 @@ int main(int argc, char** argv) {
     }
 
         
-        if (use_sync) {
-        // 1) each rank’s current time on the shared timeline
-        double me_align = aligned_now(resync_count);
+    if (use_sync) {
+    // 1) each rank’s current time on the shared timeline
+    double me = aligned_now(resync_count);
 
-        // 2) agree on a common future start time (avoid jitter)
-        double t_max;
-        MPI_Allreduce(&me_align, &t_max, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
-        double t_start = t_max + 2e-4;  // 200 µs headroom; tune 1e-4..5e-4 if needed
+    // 2) measure instantaneous skew on the aligned clock
+    double t_max, t_min;
+    MPI_Allreduce(&me, &t_max, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+    MPI_Allreduce(&me, &t_min, 1, MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD);
+    double skew = t_max - t_min;             // seconds
 
-        // 3) wait until our aligned time reaches that instant
-        struct timespec nap = {0, 20000}; // 20 µs naps to avoid busy-spin
-        while (aligned_now(resync_count) < t_start) {
+    // 3) choose headroom = skew + guard, clamped
+    const double GUARD     = 50e-6;          // 50 µs
+    const double HEAD_MIN  = 50e-6;          // 50 µs
+    const double HEAD_MAX  = 500e-6;         // 500 µs
+    double head = skew + GUARD;
+    if (head < HEAD_MIN) head = HEAD_MIN;
+    if (head > HEAD_MAX) head = HEAD_MAX;
+
+    double t_start = t_max + head;
+
+    // 4) wait: short sleeps + short spin, with a small timeout
+    struct timespec nap = {0, 20000};        // 20 µs nominal
+    const double TIMEOUT = 2e-3;             // 2 ms
+    double t0 = aligned_now(resync_count);
+    int timed_out = 0;
+
+    while (1) {
+        double now = aligned_now(resync_count);
+        if (now >= t_start) break;
+        if ((t_start - now) > 1e-4) {        // >100 µs left → nap
             nanosleep(&nap, NULL);
+        } else {
+            // final short spin (avoid scheduler latency)
+            while ((now = aligned_now(resync_count)) < t_start) { /* spin a bit */ }
+            break;
         }
+        if (aligned_now(resync_count) - t0 > TIMEOUT) { timed_out = 1; break; }
     }
-    /*
-       if (use_sync) {
-        // “grid” pacing: align to the next small boundary on the shared clock
-        const double slot_len = 200e-6;               // 200 µs; tune 100–500 µs
-        double t = aligned_now(resync_count);         // corrected time = (t_local - c)/s
-        double t_start = ceil(t / slot_len) * slot_len;
 
-        struct timespec nap = {0, 20000};            // 20 µs naps (avoid busy spin)
-        while (aligned_now(resync_count) < t_start) {
-            nanosleep(&nap, NULL);
-        }
+    // 5) light logging (rank 0, first few trials)
+    static int log_trials = 3;
+    if (rank == 0 && log_trials > 0) {
+        double waited = aligned_now(resync_count) - t0;
+        printf("align: skew=%.0f us, head=%.0f us, waited=%.0f us%s\n",
+               1e6*skew, 1e6*head, 1e6*waited, timed_out ? " (timeout)" : "");
+        --log_trials;
     }
-    */
+}
+
+
+    
         
     double start = MPI_Wtime();
     MPI_Allreduce(local_array, global_array, array_size, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
